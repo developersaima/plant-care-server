@@ -1,3 +1,4 @@
+// server/src/index.ts
 import dns from "node:dns";
 import express, { type Request, type Response, type NextFunction } from "express";
 import cors from "cors";
@@ -28,18 +29,32 @@ const client = new MongoClient(uri, {
   serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true },
 });
 
-const JWKS = createRemoteJWKSet(new URL(`${process.env.PUBLIC_URL}/api/auth/jwks`));
+// Get the auth server URL - use the client's URL or fallback to localhost
+const authServerUrl = process.env.PUBLIC_URL || "http://localhost:3000";
+const jwksUrl = `${authServerUrl}/api/auth/jwks`;
+console.log(`Using JWKS endpoint: ${jwksUrl}`);
+
+// Create JWKS with longer timeout
+const JWKS = createRemoteJWKSet(new URL(jwksUrl), {
+  timeoutDuration: 10000, // 10 seconds timeout
+  cooldownDuration: 30000, // 30 seconds cooldown
+});
 
 const verifyToken = async (req: Request, res: Response, next: NextFunction) => {
   const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith("Bearer ")) return res.status(401).send("Unauthorized");
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ message: "No token provided" });
+  }
   const token = authHeader.split(" ")[1];
   try {
+    console.log("Verifying token...");
     const { payload } = await jwtVerify(token, JWKS);
+    console.log("Token verified successfully for:", payload.email);
     req.user = payload as unknown as UserPayload;
     next();
-  } catch {
-    return res.status(403).send("Forbidden");
+  } catch (error) {
+    console.error("Token verification error:", error);
+    return res.status(403).json({ message: "Invalid or expired token" });
   }
 };
 
@@ -48,65 +63,118 @@ async function run(): Promise<void> {
   const plantsCollection = db.collection<Plant>("plants");
 
   app.post("/api/plants", verifyToken, async (req: Request, res: Response) => {
-    const newPlant: Plant = { 
+    try {
+      const newPlant: Plant = { 
         ...req.body, 
         email: req.user.email,
         createdAt: new Date(),
         updatedAt: new Date()
-    };
-    res.send(await plantsCollection.insertOne(newPlant));
+      };
+      const result = await plantsCollection.insertOne(newPlant);
+      res.status(201).json({ message: "Plant added successfully", id: result.insertedId });
+    } catch (error) {
+      console.error("Error adding plant:", error);
+      res.status(500).json({ message: "Failed to add plant" });
+    }
   });
 
   app.get("/api/plants", verifyToken, async (req: Request, res: Response) => {
-    const { manage, category, search, page = "1", limit = "10", sort = "-1" } = req.query;
-    
-    const query: { email?: string; category?: any; name?: any } = manage === "true" ? {} : { email: req.user.email };
-    if (category) query.category = category;
-    if (search) query.name = { $regex: search as string, $options: "i" };
+    try {
+      const { manage, category, search, page = "1", limit = "10", sort = "-1" } = req.query;
+      
+      const query: { email?: string; category?: any; name?: any } = manage === "true" ? {} : { email: req.user.email };
+      if (category) query.category = category;
+      if (search) query.name = { $regex: search as string, $options: "i" };
 
-    const pageNum = parseInt(page as string);
-    const limitNum = parseInt(limit as string);
-    
-    const plants = await plantsCollection
-      .find(query)
-      .sort({ price: parseInt(sort as string) === 1 ? 1 : -1 })
-      .skip((pageNum - 1) * limitNum)
-      .limit(limitNum)
-      .toArray();
+      const pageNum = parseInt(page as string);
+      const limitNum = parseInt(limit as string);
+      
+      const plants = await plantsCollection
+        .find(query)
+        .sort({ price: parseInt(sort as string) === 1 ? 1 : -1 })
+        .skip((pageNum - 1) * limitNum)
+        .limit(limitNum)
+        .toArray();
 
-    const total = await plantsCollection.countDocuments(query);
-    res.send({ plants, total, pages: Math.ceil(total / limitNum) });
+      const total = await plantsCollection.countDocuments(query);
+      res.send({ plants, total, pages: Math.ceil(total / limitNum) });
+    } catch (error) {
+      console.error("Error fetching plants:", error);
+      res.status(500).json({ message: "Failed to fetch plants" });
+    }
   });
+// server/src/index.ts - Add this route after the other routes
 
-  app.patch("/api/plants/:id", verifyToken, async (req: Request, res: Response) => {
+app.get("/api/plants/:id", verifyToken, async (req: Request, res: Response) => {
+  try {
     const id = req.params.id;
-    if (typeof id !== 'string') return res.status(400).send("Invalid ID");
+    if (typeof id !== 'string' || !ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid ID" });
+    }
     
-    const query = { _id: new ObjectId(id) };
-    res.send(await plantsCollection.updateOne(query, { $set: { ...req.body, updatedAt: new Date() } }));
+    const plant = await plantsCollection.findOne({ _id: new ObjectId(id) });
+    
+    if (!plant) {
+      return res.status(404).json({ message: "Plant not found" });
+    }
+    
+    if (plant.email !== req.user.email) {
+      return res.status(403).json({ message: "Unauthorized" });
+    }
+    
+    res.json(plant);
+  } catch (error) {
+    console.error("Error fetching plant:", error);
+    res.status(500).json({ message: "Failed to fetch plant" });
+  }
+});
+  app.patch("/api/plants/:id", verifyToken, async (req: Request, res: Response) => {
+    try {
+      const id = req.params.id;
+      if (typeof id !== 'string') return res.status(400).send("Invalid ID");
+      
+      const query = { _id: new ObjectId(id) };
+      const result = await plantsCollection.updateOne(query, { $set: { ...req.body, updatedAt: new Date() } });
+      res.json({ message: "Plant updated successfully", result });
+    } catch (error) {
+      console.error("Error updating plant:", error);
+      res.status(500).json({ message: "Failed to update plant" });
+    }
   });
 
   app.delete("/api/plants/:id", verifyToken, async (req: Request, res: Response) => {
-    const id = req.params.id;
-    if (typeof id !== 'string') return res.status(400).send("Invalid ID");
-
-    res.send(await plantsCollection.deleteOne({ _id: new ObjectId(id) }));
+    try {
+      const id = req.params.id;
+      if (typeof id !== 'string') return res.status(400).send("Invalid ID");
+      const result = await plantsCollection.deleteOne({ _id: new ObjectId(id) });
+      res.json({ message: "Plant deleted successfully", result });
+    } catch (error) {
+      console.error("Error deleting plant:", error);
+      res.status(500).json({ message: "Failed to delete plant" });
+    }
   });
 
   app.get("/api/dashboard/stats", verifyToken, async (req: Request, res: Response) => {
-    const stats = await plantsCollection.aggregate([
-      { $group: { _id: "$category", count: { $sum: 1 }, totalPrice: { $sum: "$price" } } }
-    ]).toArray();
-    res.send({ totalPlants: await plantsCollection.countDocuments(), stats });
+    try {
+      const stats = await plantsCollection.aggregate([
+        { $group: { _id: "$category", count: { $sum: 1 }, totalPrice: { $sum: "$price" } } }
+      ]).toArray();
+      res.send({ totalPlants: await plantsCollection.countDocuments(), stats });
+    } catch (error) {
+      console.error("Error fetching stats:", error);
+      res.status(500).json({ message: "Failed to fetch stats" });
+    }
   });
 
-  console.log("DB connected");
+  await client.connect();
+  console.log("✅ Database connected");
+  console.log(`✅ Server running on port ${port}`);
 }
 
 run().catch(console.dir);
 
 if (process.env.NODE_ENV !== "production") {
-  app.listen(port, () => console.log(`Server running`));
+  app.listen(port, () => console.log(`Server running on http://localhost:${port}`));
 }
 
 export default app;
