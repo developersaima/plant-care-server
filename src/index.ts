@@ -207,9 +207,9 @@ async function run(): Promise<void> {
     }
   });
 
-  await client.connect();
-  console.log("✅ Database connected");
-  console.log(`✅ Server running on port ${port}`);
+  // await client.connect();
+  // console.log("✅ Database connected");
+  // console.log(`✅ Server running on port ${port}`);
 }
 
 run().catch(console.dir);
