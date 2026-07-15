@@ -29,15 +29,13 @@ const client = new MongoClient(uri, {
   serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true },
 });
 
-// Get the auth server URL - use the client's URL or fallback to localhost
 const authServerUrl = process.env.PUBLIC_URL || "http://localhost:3000";
 const jwksUrl = `${authServerUrl}/api/auth/jwks`;
 console.log(`Using JWKS endpoint: ${jwksUrl}`);
 
-// Create JWKS with longer timeout
 const JWKS = createRemoteJWKSet(new URL(jwksUrl), {
-  timeoutDuration: 10000, // 10 seconds timeout
-  cooldownDuration: 30000, // 30 seconds cooldown
+  timeoutDuration: 10000,
+  cooldownDuration: 30000,
 });
 
 const verifyToken = async (req: Request, res: Response, next: NextFunction) => {
@@ -62,6 +60,7 @@ async function run(): Promise<void> {
   const db = client.db("plant-care");
   const plantsCollection = db.collection<Plant>("plants");
 
+  // POST - Add new plant
   app.post("/api/plants", verifyToken, async (req: Request, res: Response) => {
     try {
       const newPlant: Plant = { 
@@ -78,63 +77,89 @@ async function run(): Promise<void> {
     }
   });
 
+  // GET all plants with pagination
   app.get("/api/plants", verifyToken, async (req: Request, res: Response) => {
     try {
       const { manage, category, search, page = "1", limit = "10", sort = "-1" } = req.query;
       
-      const query: { email?: string; category?: any; name?: any } = manage === "true" ? {} : { email: req.user.email };
+      const query: any = {};
+      if (manage !== "true") {
+        query.email = req.user.email;
+      }
       if (category) query.category = category;
-      if (search) query.name = { $regex: search as string, $options: "i" };
+      if (search) query.title = { $regex: search as string, $options: "i" };
 
       const pageNum = parseInt(page as string);
       const limitNum = parseInt(limit as string);
       
       const plants = await plantsCollection
         .find(query)
-        .sort({ price: parseInt(sort as string) === 1 ? 1 : -1 })
+        .sort({ createdAt: parseInt(sort as string) === 1 ? 1 : -1 })
         .skip((pageNum - 1) * limitNum)
         .limit(limitNum)
         .toArray();
 
       const total = await plantsCollection.countDocuments(query);
-      res.send({ plants, total, pages: Math.ceil(total / limitNum) });
+      res.json({ plants, total, pages: Math.ceil(total / limitNum) });
     } catch (error) {
       console.error("Error fetching plants:", error);
       res.status(500).json({ message: "Failed to fetch plants" });
     }
   });
-// server/src/index.ts - Add this route after the other routes
 
-app.get("/api/plants/:id", verifyToken, async (req: Request, res: Response) => {
-  try {
-    const id = req.params.id;
-    if (typeof id !== 'string' || !ObjectId.isValid(id)) {
-      return res.status(400).json({ message: "Invalid ID" });
+  // GET single plant by ID
+  app.get("/api/plants/:id", verifyToken, async (req: Request, res: Response) => {
+    try {
+      const id = req.params.id;
+      console.log("Fetching plant with ID:", id);
+      
+      if (!id || typeof id !== 'string') {
+        return res.status(400).json({ message: "Invalid ID format" });
+      }
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ message: "Invalid ID format" });
+      }
+
+      const plant = await plantsCollection.findOne({ _id: new ObjectId(id) });
+      
+      console.log("Plant found:", plant ? "Yes" : "No");
+      
+      if (!plant) {
+        return res.status(404).json({ message: "Plant not found" });
+      }
+      
+      if (plant.email !== req.user.email) {
+        return res.status(403).json({ message: "Unauthorized access" });
+      }
+      
+      res.json(plant);
+    } catch (error) {
+      console.error("Error fetching plant:", error);
+      res.status(500).json({ message: "Failed to fetch plant" });
     }
-    
-    const plant = await plantsCollection.findOne({ _id: new ObjectId(id) });
-    
-    if (!plant) {
-      return res.status(404).json({ message: "Plant not found" });
-    }
-    
-    if (plant.email !== req.user.email) {
-      return res.status(403).json({ message: "Unauthorized" });
-    }
-    
-    res.json(plant);
-  } catch (error) {
-    console.error("Error fetching plant:", error);
-    res.status(500).json({ message: "Failed to fetch plant" });
-  }
-});
+  });
+
+  // PATCH - Update plant
   app.patch("/api/plants/:id", verifyToken, async (req: Request, res: Response) => {
     try {
       const id = req.params.id;
-      if (typeof id !== 'string') return res.status(400).send("Invalid ID");
+      if (typeof id !== 'string' || !ObjectId.isValid(id)) {
+        return res.status(400).json({ message: "Invalid ID" });
+      }
       
-      const query = { _id: new ObjectId(id) };
-      const result = await plantsCollection.updateOne(query, { $set: { ...req.body, updatedAt: new Date() } });
+      const plant = await plantsCollection.findOne({ _id: new ObjectId(id) });
+      if (!plant) {
+        return res.status(404).json({ message: "Plant not found" });
+      }
+      if (plant.email !== req.user.email) {
+        return res.status(403).json({ message: "Unauthorized" });
+      }
+      
+      const result = await plantsCollection.updateOne(
+        { _id: new ObjectId(id) }, 
+        { $set: { ...req.body, updatedAt: new Date() } }
+      );
       res.json({ message: "Plant updated successfully", result });
     } catch (error) {
       console.error("Error updating plant:", error);
@@ -142,10 +167,22 @@ app.get("/api/plants/:id", verifyToken, async (req: Request, res: Response) => {
     }
   });
 
+  // DELETE - Remove plant
   app.delete("/api/plants/:id", verifyToken, async (req: Request, res: Response) => {
     try {
       const id = req.params.id;
-      if (typeof id !== 'string') return res.status(400).send("Invalid ID");
+      if (typeof id !== 'string' || !ObjectId.isValid(id)) {
+        return res.status(400).json({ message: "Invalid ID" });
+      }
+      
+      const plant = await plantsCollection.findOne({ _id: new ObjectId(id) });
+      if (!plant) {
+        return res.status(404).json({ message: "Plant not found" });
+      }
+      if (plant.email !== req.user.email) {
+        return res.status(403).json({ message: "Unauthorized" });
+      }
+      
       const result = await plantsCollection.deleteOne({ _id: new ObjectId(id) });
       res.json({ message: "Plant deleted successfully", result });
     } catch (error) {
@@ -154,12 +191,16 @@ app.get("/api/plants/:id", verifyToken, async (req: Request, res: Response) => {
     }
   });
 
+  // GET dashboard stats
   app.get("/api/dashboard/stats", verifyToken, async (req: Request, res: Response) => {
     try {
       const stats = await plantsCollection.aggregate([
-        { $group: { _id: "$category", count: { $sum: 1 }, totalPrice: { $sum: "$price" } } }
+        { $match: { email: req.user.email } },
+        { $group: { _id: "$category", count: { $sum: 1 } } }
       ]).toArray();
-      res.send({ totalPlants: await plantsCollection.countDocuments(), stats });
+      
+      const totalPlants = await plantsCollection.countDocuments({ email: req.user.email });
+      res.json({ totalPlants, stats });
     } catch (error) {
       console.error("Error fetching stats:", error);
       res.status(500).json({ message: "Failed to fetch stats" });
